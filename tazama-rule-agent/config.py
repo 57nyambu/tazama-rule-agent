@@ -31,6 +31,7 @@ class Config:
 
     # Script
     INSTALL_SCRIPT_PATH: str = os.getenv("INSTALL_SCRIPT_PATH", "./install-rule.sh")
+    SUDO_PASSWORD: str    = os.getenv("SUDO_PASSWORD", "")
     SCRIPT_TIMEOUT: int   = 300
 
     # Logging
