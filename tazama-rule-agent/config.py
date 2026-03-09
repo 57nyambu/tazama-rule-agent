@@ -28,11 +28,12 @@ class Config:
     CONFIGMAP: str        = os.getenv("CONFIGMAP", "tazama-rule-common-config")
     IMAGE_ORG: str        = os.getenv("IMAGE_ORG", "tazamaorg")
     IMAGE_TAG: str        = os.getenv("IMAGE_TAG", "3.0.0")
+    KUBECONFIG: str       = os.getenv("KUBECONFIG", os.path.expanduser("~/.kube/config"))
 
     # Script
     INSTALL_SCRIPT_PATH: str = os.getenv("INSTALL_SCRIPT_PATH", "./install-rule.sh")
     SUDO_PASSWORD: str    = os.getenv("SUDO_PASSWORD", "")
-    SCRIPT_TIMEOUT: int   = 300
+    SCRIPT_TIMEOUT: int   = int(os.getenv("SCRIPT_TIMEOUT", 600))
 
     # Logging
     LOG_LEVEL: str        = os.getenv("LOG_LEVEL", "DEBUG")
