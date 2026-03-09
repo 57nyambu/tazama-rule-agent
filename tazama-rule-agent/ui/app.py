@@ -1,17 +1,23 @@
 # ui/app.py
+# ─────────────────────────────────────────────────────────────────
+# Tazama Rule Agent — Catalog UI
+# Local Intelligence Engine: browse, select, and batch-install rules.
+# ─────────────────────────────────────────────────────────────────
 import streamlit as st
 import threading
 import queue
-import json
 import sys
 import os
-import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agent import run_pipeline
-from config import cfg, AVAILABLE_MODELS, MODEL_IDS
-from utils.openai_client import test_connection
+from agent import run_single, run_batch
+from config import cfg
+from rules_knowledge import (
+    RULE_CATALOG, ALREADY_RUNNING,
+    get_installable_rules, get_running_rules,
+    validate_rule_config, ms_to_human,
+)
 
 st.set_page_config(
     page_title="Tazama Rule Agent",
@@ -34,7 +40,6 @@ st.markdown("""
     color: #e2e8f0;
   }
 
-  /* ── Header ── */
   .hero-title {
     font-family: 'Syne', sans-serif;
     font-size: 2.2rem;
@@ -51,7 +56,6 @@ st.markdown("""
     margin-top: 0;
   }
 
-  /* ── Cards ── */
   .glass-card {
     background: rgba(17, 24, 39, 0.7);
     backdrop-filter: blur(12px);
@@ -61,24 +65,8 @@ st.markdown("""
     margin-bottom: 1rem;
     transition: border-color 0.2s;
   }
-  .glass-card:hover {
-    border-color: rgba(99, 102, 241, 0.35);
-  }
+  .glass-card:hover { border-color: rgba(99, 102, 241, 0.35); }
 
-  /* ── Stage badges ── */
-  .stage-badge {
-    display: inline-block;
-    background: linear-gradient(135deg, #1e3a5f, #1e2d45);
-    color: #60a5fa;
-    font-size: 0.65rem;
-    font-weight: 700;
-    padding: 3px 12px;
-    border-radius: 20px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-  }
-
-  /* ── Log box ── */
   .log-box {
     background: rgba(7, 11, 20, 0.9);
     border: 1px solid #1a2744;
@@ -86,7 +74,7 @@ st.markdown("""
     padding: 1rem 1.2rem;
     font-size: 0.72rem;
     color: #94a3b8;
-    height: 420px;
+    height: 520px;
     overflow-y: auto;
     line-height: 1.8;
     scrollbar-width: thin;
@@ -95,40 +83,22 @@ st.markdown("""
   .log-box::-webkit-scrollbar { width: 6px; }
   .log-box::-webkit-scrollbar-track { background: transparent; }
   .log-box::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
-
   .success { color: #34d399; }
   .error   { color: #f87171; }
   .info    { color: #60a5fa; }
   .warn    { color: #fbbf24; }
-  .model   { color: #a78bfa; }
+  .accent  { color: #a78bfa; }
   .dim     { color: #475569; }
 
-  /* ── Sidebar ── */
   div[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #080c18 0%, #0a1020 100%);
     border-right: 1px solid rgba(99, 102, 241, 0.1);
   }
 
-  /* ── Status indicators ── */
-  .status-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-right: 6px;
-    vertical-align: middle;
-  }
-  .status-ok   { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.5); }
-  .status-fail { background: #f87171; box-shadow: 0 0 6px rgba(248, 113, 113, 0.5); }
-  .status-idle { background: #475569; }
-
-  /* ── Model tier badges ── */
-  .tier-fast      { background: #064e3b; color: #34d399; }
-  .tier-balanced  { background: #1e3a5f; color: #60a5fa; }
-  .tier-quality   { background: #3b0764; color: #c084fc; }
-  .tier-reasoning { background: #78350f; color: #fbbf24; }
-  .tier-legacy    { background: #1f2937; color: #6b7280; }
-  .tier-badge {
+  .cat-local         { background: #064e3b; color: #34d399; }
+  .cat-international  { background: #1e3a5f; color: #60a5fa; }
+  .cat-system         { background: #1f2937; color: #6b7280; }
+  .cat-badge {
     display: inline-block;
     font-size: 0.6rem;
     font-weight: 700;
@@ -136,9 +106,35 @@ st.markdown("""
     border-radius: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+    margin-right: 4px;
+  }
+  .running-badge {
+    display: inline-block;
+    background: #064e3b;
+    color: #34d399;
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
 
-  /* ── Fix Streamlit button styling ── */
+  .rule-card {
+    background: rgba(17, 24, 39, 0.5);
+    border: 1px solid rgba(99, 102, 241, 0.1);
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 0.5rem;
+  }
+  .rule-card-running {
+    background: rgba(6, 78, 59, 0.15);
+    border: 1px solid rgba(52, 211, 153, 0.15);
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 0.5rem;
+  }
+
   .stButton > button[kind="primary"] {
     background: linear-gradient(135deg, #4f46e5, #6366f1);
     border: none;
@@ -151,303 +147,355 @@ st.markdown("""
     background: linear-gradient(135deg, #6366f1, #818cf8);
     box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
   }
+
+  /* stats row */
+  .stat-box {
+    background: rgba(17, 24, 39, 0.6);
+    border: 1px solid rgba(99, 102, 241, 0.12);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    text-align: center;
+  }
+  .stat-num {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: #60a5fa;
+    margin: 0;
+  }
+  .stat-label {
+    color: #64748b;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Session state init ──────────────────────────────────────────────
+# ── Session state ───────────────────────────────────────────────────
 for key, default in {
     "installed_rules": [],
     "log_lines": [],
-    "last_result": None,
-    "api_status": None,
-    "selected_model": cfg.OPENAI_MODEL,
+    "batch_result": None,
+    "running": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
+installable = get_installable_rules()
+running = get_running_rules()
+
 
 # ── Sidebar ─────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
+    st.markdown("## ⚙️ Configuration")
     st.markdown("---")
 
-    # ── Model selector ──
-    st.markdown("### 🧠 Model Selection")
-
-    model_options = [m["id"] for m in AVAILABLE_MODELS]
-    model_labels = []
-    for m in AVAILABLE_MODELS:
-        tier = m["tier"]
-        label = f"{m['label']}  •  {m['tpm']//1000}K TPM"
-        model_labels.append(label)
-
-    current_idx = model_options.index(st.session_state.selected_model) \
-        if st.session_state.selected_model in model_options else 0
-
-    selected_idx = st.selectbox(
-        "Choose model",
-        range(len(model_options)),
-        index=current_idx,
-        format_func=lambda i: model_labels[i],
-        help="Select which OpenAI model to use for AI stages (1-3)",
-    )
-    st.session_state.selected_model = model_options[selected_idx]
-    selected_model_info = AVAILABLE_MODELS[selected_idx]
-
-    # Model info card
-    tier = selected_model_info["tier"]
-    st.markdown(f"""
-<div class="glass-card" style="padding: 1rem;">
-  <span class="tier-badge tier-{tier}">{tier}</span>
-  <div style="margin-top: 8px; font-size: 0.8rem; color: #94a3b8;">
-    {selected_model_info['description']}<br>
-    <span class="dim">{selected_model_info['tpm']:,} TPM · {selected_model_info['rpm']} RPM · {selected_model_info['rpd']} RPD</span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-    # ── API connectivity test ──
-    st.markdown("### 🔌 API Connection")
-    if st.button("🧪 Test API Connection", use_container_width=True):
-        with st.spinner(f"Testing {st.session_state.selected_model}..."):
-            status = test_connection(model=st.session_state.selected_model)
-            st.session_state.api_status = status
-
-    if st.session_state.api_status:
-        s = st.session_state.api_status
-        if s["success"]:
-            st.markdown(f"""
-<div class="glass-card" style="padding: 0.8rem;">
-  <span class="status-dot status-ok"></span>
-  <strong style="color: #34d399;">Connected</strong><br>
-  <span class="dim" style="font-size: 0.75rem;">
-    Model: {s['model']}<br>
-    Latency: {s['latency_ms']}ms<br>
-    Tokens: {s.get('tokens_used', {}).get('total', '?')}
-  </span>
-</div>
-""", unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-<div class="glass-card" style="padding: 0.8rem; border-color: rgba(248, 113, 113, 0.3);">
-  <span class="status-dot status-fail"></span>
-  <strong style="color: #f87171;">Connection Failed</strong><br>
-  <span style="font-size: 0.72rem; color: #f87171; word-break: break-all;">
-    {s['message'][:200]}
-  </span>
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Infra config display ──
     st.markdown("### 🏗️ Infrastructure")
     st.markdown(f"""
-<div style="font-size: 0.78rem; color: #64748b; line-height: 2;">
+<div style="font-size: 0.78rem; color: #64748b; line-height: 2.2;">
   Namespace: <code>{cfg.NAMESPACE}</code><br>
   Image tag: <code>{cfg.IMAGE_TAG}</code><br>
   Typology: <code>{cfg.TYPOLOGY_ID}</code><br>
-  Log level: <code>{cfg.LOG_LEVEL}</code>
+  PG deploy: <code>{cfg.PG_DEPLOY}</code><br>
+  Database:  <code>{cfg.PG_DB}</code><br>
+  Script: <code>{cfg.INSTALL_SCRIPT_PATH}</code>
 </div>
 """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Installed rules ──
     st.markdown("### 📋 Session History")
     if st.session_state.installed_rules:
         for r in st.session_state.installed_rules:
             icon = "✅" if r.get("success") else "❌"
-            model_used = r.get("model", "?")
-            st.markdown(
-                f"{icon} `rule-{r['rule_num']}` — {model_used}",
-            )
+            st.markdown(f"{icon} `rule-{r['rule_num']}`")
     else:
         st.caption("No rules installed this session.")
 
     st.markdown("---")
 
-    # ── Recent logs ──
+    st.markdown("### 🗂️ Log Files")
     log_dir = cfg.LOG_DIR
     if os.path.isdir(log_dir):
         logs = sorted(os.listdir(log_dir), reverse=True)[:5]
-        if logs:
-            st.markdown("### 🗂️ Recent Logs")
-            for l in logs:
-                st.caption(l)
+        for lf in logs:
+            st.caption(lf)
+    else:
+        st.caption("No logs yet.")
+
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:0.68rem; color:#334155;">'
+        'Local Intelligence Engine v2.0<br>'
+        'No AI dependency — pre-computed configs'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
 
-# ── Main Header ─────────────────────────────────────────────────────
+# ── Header ──────────────────────────────────────────────────────────
 st.markdown('<p class="hero-title">🛡️ Tazama Rule Agent</p>', unsafe_allow_html=True)
-st.markdown(f'<p class="hero-sub">Autonomous rule installation · Powered by <strong>{st.session_state.selected_model}</strong></p>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="hero-sub">Autonomous rule installation · Local Intelligence Engine · '
+    'Click to install</p>',
+    unsafe_allow_html=True,
+)
 st.markdown("---")
 
-# ── Layout ──────────────────────────────────────────────────────────
-col1, col2 = st.columns([1, 1], gap="large")
+# ── Stats Row ───────────────────────────────────────────────────────
+s1, s2, s3, s4 = st.columns(4)
+with s1:
+    st.markdown(f'''<div class="stat-box">
+        <p class="stat-num">{len(RULE_CATALOG)}</p>
+        <p class="stat-label">Total Rules</p></div>''', unsafe_allow_html=True)
+with s2:
+    st.markdown(f'''<div class="stat-box">
+        <p class="stat-num">{len(running)}</p>
+        <p class="stat-label">Running</p></div>''', unsafe_allow_html=True)
+with s3:
+    st.markdown(f'''<div class="stat-box">
+        <p class="stat-num" style="color:#a78bfa;">{len(installable)}</p>
+        <p class="stat-label">Available to Install</p></div>''', unsafe_allow_html=True)
+with s4:
+    installed_this_session = sum(
+        1 for r in st.session_state.installed_rules if r.get("success")
+    )
+    st.markdown(f'''<div class="stat-box">
+        <p class="stat-num" style="color:#34d399;">{installed_this_session}</p>
+        <p class="stat-label">Installed This Session</p></div>''', unsafe_allow_html=True)
 
-with col1:
-    st.markdown("### 🚀 Install a Rule")
+st.markdown("")
 
-    with st.form("rule_form", clear_on_submit=False):
-        rule_num = st.text_input(
-            "Rule Number",
-            placeholder="e.g. 030",
-            help="3-digit rule number (e.g. 006, 028, 030)",
-        )
-        description = st.text_area(
-            "Rule Description",
-            placeholder="e.g. Transfer to unfamiliar creditor account - debtor",
-            height=120,
-            help="Human-readable description of the financial crime pattern this rule detects",
-        )
+# ── Main Layout ─────────────────────────────────────────────────────
+col_catalog, col_log = st.columns([1, 1], gap="large")
 
-        fcol1, fcol2 = st.columns([2, 1])
-        with fcol1:
-            submitted = st.form_submit_button(
-                "🚀 Install Rule",
-                use_container_width=True,
-                type="primary",
+# ── Left Column — Rule Catalog ──────────────────────────────────────
+with col_catalog:
+    st.markdown("### 📋 Rule Catalog")
+
+    # ── Installable rules with checkboxes ───────────────────────
+    st.markdown(
+        f'<span style="color:#a78bfa; font-size:0.85rem; font-weight:600;">'
+        f'Available to Install ({len(installable)})</span>',
+        unsafe_allow_html=True,
+    )
+
+    # Select all toggle
+    select_all = st.checkbox("Select all rules", key="select_all")
+
+    sorted_installable = sorted(installable.keys())
+
+    for rn in sorted_installable:
+        rule = installable[rn]
+        cats_html = ""
+        for cat in rule.get("categories", []):
+            cats_html += f'<span class="cat-badge cat-{cat}">{cat}</span>'
+        qr = ms_to_human(rule["maxQueryRange"])
+        b_count = len(rule["bands"])
+        e_count = len(rule["exit_conditions"])
+        w_count = len(rule["weights"])
+
+        cb_col, info_col = st.columns([0.08, 0.92])
+        with cb_col:
+            st.checkbox(
+                f"rule-{rn}",
+                value=select_all,
+                key=f"rule_{rn}",
+                label_visibility="collapsed",
             )
-        with fcol2:
-            dry_run = st.form_submit_button(
-                "🔍 Dry Run (AI only)",
-                use_container_width=True,
-            )
+        with info_col:
+            st.markdown(f"""
+<div class="rule-card">
+  <div style="display:flex; align-items:center; justify-content:space-between;">
+    <div>
+      <strong style="color:#e2e8f0; font-size:0.9rem;">rule-{rn}</strong>
+      <span style="color:#64748b; font-size:0.78rem; margin-left:8px;">{rule['description']}</span>
+    </div>
+    <div>{cats_html}</div>
+  </div>
+  <div style="margin-top:6px; font-size:0.68rem; color:#475569;">
+    📊 {b_count} bands · 🚪 {e_count} exits · ⚖️ {w_count} weights · ⏱️ {qr}
+  </div>
+</div>""", unsafe_allow_html=True)
 
-    # ── Stage output cards ──
-    if st.session_state.last_result:
-        res = st.session_state.last_result
-        st.markdown("### 📊 Stage Outputs")
+    st.markdown("")
 
-        if res.get("stage1"):
-            with st.expander("🔬 Stage 1 — Rule Metadata", expanded=False):
-                s1 = res["stage1"]
-                c1, c2 = st.columns(2)
-                with c1:
-                    qr = s1.get("maxQueryRange", 0)
-                    days = qr / 86400000
-                    st.metric("Query Range", f"{days:.0f} days", f"{qr:,} ms")
-                with c2:
-                    st.metric("Exit Conditions", len(s1.get("exit_conditions", [])))
-                st.json(s1)
+    # ── Already running rules ───────────────────────────────────
+    st.markdown(
+        f'<span style="color:#34d399; font-size:0.85rem; font-weight:600;">'
+        f'Already Running ({len(running)})</span>',
+        unsafe_allow_html=True,
+    )
 
-        if res.get("stage2"):
-            with st.expander("📊 Stage 2 — Bands", expanded=False):
-                s2 = res["stage2"]
-                st.metric("Bands", len(s2.get("bands", [])))
-                if s2.get("measured_value_explanation"):
-                    st.info(f"📐 **Measured value:** {s2['measured_value_explanation']}")
-                st.json(s2)
+    for rn in sorted(running.keys()):
+        rule = running[rn]
+        cats_html = ""
+        for cat in rule.get("categories", []):
+            cats_html += f'<span class="cat-badge cat-{cat}">{cat}</span>'
 
-        if res.get("stage3"):
-            with st.expander("⚖️ Stage 3 — Weights", expanded=False):
-                s3 = res["stage3"]
-                st.metric("Weight Entries", len(s3.get("weights", [])))
-                st.json(s3)
+        st.markdown(f"""
+<div class="rule-card-running">
+  <div style="display:flex; align-items:center; justify-content:space-between;">
+    <div>
+      <span class="running-badge">✓ RUNNING</span>
+      <strong style="color:#94a3b8; font-size:0.9rem; margin-left:8px;">rule-{rn}</strong>
+      <span style="color:#4b5563; font-size:0.78rem; margin-left:8px;">{rule['description']}</span>
+    </div>
+    <div>{cats_html}</div>
+  </div>
+</div>""", unsafe_allow_html=True)
 
-        if res.get("stage4"):
-            with st.expander("🔧 Stage 4 — Script Execution", expanded=False):
-                s4 = res["stage4"]
-                if s4.get("success"):
-                    st.success("Script completed successfully")
-                else:
-                    st.error("Script execution failed")
+    st.markdown("")
 
-with col2:
+    # ── Install button ──────────────────────────────────────────
+    selected = [rn for rn in sorted_installable if st.session_state.get(f"rule_{rn}", False)]
+
+    bcol1, bcol2 = st.columns([3, 1])
+    with bcol1:
+        install_clicked = st.button(
+            f"🚀 Install Selected ({len(selected)} rules)",
+            disabled=len(selected) == 0 or st.session_state.running,
+            use_container_width=True,
+            type="primary",
+        )
+    with bcol2:
+        preview_clicked = st.button(
+            "🔍 Preview",
+            disabled=len(selected) == 0,
+            use_container_width=True,
+        )
+
+    # ── Config preview ──────────────────────────────────────────
+    if preview_clicked and selected:
+        st.markdown("### 🔬 Configuration Preview")
+        for rn in selected:
+            rule = RULE_CATALOG[rn]
+            issues = validate_rule_config(rn)
+            valid_icon = "✅" if not issues else "⚠️"
+            with st.expander(f"{valid_icon} rule-{rn}: {rule['description']}", expanded=False):
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    st.metric("Query Range", ms_to_human(rule["maxQueryRange"]))
+                with mc2:
+                    st.metric("Bands", len(rule["bands"]))
+                with mc3:
+                    st.metric("Exit Conditions", len(rule["exit_conditions"]))
+
+                st.markdown("**Bands:**")
+                for b in rule["bands"]:
+                    limits = []
+                    if "lowerLimit" in b:
+                        limits.append(f"≥{b['lowerLimit']}")
+                    if "upperLimit" in b:
+                        limits.append(f"<{b['upperLimit']}")
+                    lim = " ".join(limits) or "—"
+                    st.markdown(f"- `{b['subRuleRef']}` [{lim}]: {b['reason']}")
+
+                st.markdown("**Exit Conditions:**")
+                for ec in rule["exit_conditions"]:
+                    st.markdown(f"- `{ec['subRuleRef']}`: {ec['reason']}")
+
+                st.markdown("**Weights:**")
+                for w in rule["weights"]:
+                    bar = "█" * (int(w["wght"]) // 100) if w["wght"] != "0" else "○"
+                    st.markdown(f"- `{w['ref']}` → {w['wght']} {bar}")
+
+                if issues:
+                    st.warning("Validation issues:\n" + "\n".join(f"- {i}" for i in issues))
+
+
+# ── Right Column — Live Log ─────────────────────────────────────────
+with col_log:
     st.markdown("### 📡 Live Agent Log")
     log_placeholder = st.empty()
     status_placeholder = st.empty()
 
     def render_log():
         lines_html = ""
-        for line in st.session_state.log_lines[-150:]:
+        for line in st.session_state.log_lines[-200:]:
             if "[ERROR]" in line or "❌" in line:
                 cls = "error"
-            elif "✅" in line or "✓" in line:
+            elif "✅" in line or "✓" in line or "COMPLETE" in line:
                 cls = "success"
-            elif "▶" in line or "Stage" in line:
+            elif "▶" in line or "📦" in line or "🚀" in line:
                 cls = "info"
             elif "[WARN]" in line or "⚠" in line:
                 cls = "warn"
-            elif "🧠" in line or "model" in line.lower():
-                cls = "model"
-            elif "ℹ" in line:
+            elif "═" in line or "─" in line:
+                cls = "accent"
+            elif "ℹ" in line or "📋" in line:
                 cls = "dim"
             else:
                 cls = ""
             safe = line.replace("<", "&lt;").replace(">", "&gt;")
             lines_html += f'<div class="{cls}">{safe}</div>'
         if not lines_html:
-            lines_html = '<div class="dim">Waiting for pipeline to start...</div>'
+            lines_html = '<div class="dim">Select rules from the catalog and click Install...</div>'
         log_placeholder.markdown(
             f'<div class="log-box">{lines_html}</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
     render_log()
 
 
-# ── Pipeline execution ───────────────────────────────────────────────
-should_run = submitted or dry_run
+# ── Pipeline Execution ──────────────────────────────────────────────
+if install_clicked and selected:
+    st.session_state.log_lines = []
+    st.session_state.batch_result = None
+    st.session_state.running = True
 
-if should_run:
-    if not rule_num or not rule_num.strip() or not description or not description.strip():
-        st.error("Both rule number and description are required.")
-    else:
-        st.session_state.log_lines = []
-        st.session_state.last_result = None
+    msg_queue = queue.Queue()
 
-        msg_queue = queue.Queue()
+    def callback(msg: str):
+        msg_queue.put(msg)
 
-        def callback(msg: str):
-            msg_queue.put(msg)
+    def run_agent_batch():
+        result = run_batch(selected, stream_callback=callback)
+        msg_queue.put(("__DONE__", result))
 
-        def run_agent():
-            result = run_pipeline(
-                rule_num=rule_num.strip(),
-                description=description.strip(),
-                stream_callback=callback,
-                model=st.session_state.selected_model,
-            )
-            msg_queue.put(("__DONE__", result))
+    thread = threading.Thread(target=run_agent_batch, daemon=True)
+    thread.start()
 
-        thread = threading.Thread(target=run_agent, daemon=True)
-        thread.start()
-
-        action = "Dry run" if dry_run else "Installing"
-        with st.spinner(f"{action} with {st.session_state.selected_model}..."):
-            while True:
-                try:
-                    item = msg_queue.get(timeout=0.3)
-                except queue.Empty:
-                    if not thread.is_alive():
-                        break
-                    render_log()
-                    continue
-
-                if isinstance(item, tuple) and item[0] == "__DONE__":
-                    result = item[1]
-                    st.session_state.last_result = result
-                    st.session_state.installed_rules.append(result)
+    with st.spinner(f"Installing {len(selected)} rules..."):
+        while True:
+            try:
+                item = msg_queue.get(timeout=0.3)
+            except queue.Empty:
+                if not thread.is_alive():
                     break
-
-                st.session_state.log_lines.append(item)
                 render_log()
+                continue
 
-        # Final status
-        result = st.session_state.last_result
-        if result and result.get("success"):
+            if isinstance(item, tuple) and item[0] == "__DONE__":
+                batch = item[1]
+                st.session_state.batch_result = batch
+                # Add individual results to session history
+                for rn, r in batch.get("results", {}).items():
+                    st.session_state.installed_rules.append(r)
+                break
+
+            st.session_state.log_lines.append(item)
+            render_log()
+
+    st.session_state.running = False
+
+    # Final summary
+    batch = st.session_state.batch_result
+    if batch:
+        if batch["failed"] == 0 and batch["succeeded"] > 0:
             status_placeholder.success(
-                f"✅ Rule {rule_num} installed and registered successfully."
+                f"✅ All {batch['succeeded']} rules installed successfully!"
             )
-        elif result and result.get("error"):
-            status_placeholder.error(
-                f"❌ Pipeline error: {result['error'][:300]}"
-            )
-        elif result:
+        elif batch["succeeded"] > 0:
             status_placeholder.warning(
-                f"⚠️ Pipeline completed but script execution failed. Check logs."
+                f"⚠️ {batch['succeeded']} succeeded, {batch['failed']} failed. Check logs."
+            )
+        else:
+            status_placeholder.error(
+                f"❌ Installation failed. {batch['failed']} rules failed."
             )
 
-        st.rerun()
+    st.rerun()

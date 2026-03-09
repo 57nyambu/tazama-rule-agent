@@ -1,22 +1,25 @@
 # agent.py
-# Runs all 4 stages in sequence with full error handling.
-# Supports dynamic model selection per run.
+# ─────────────────────────────────────────────────────────────────
+# Local Intelligence Engine — Orchestrator
+# Uses pre-computed rule knowledge (no AI dependency).
+# Supports single rule and batch installation.
+# ─────────────────────────────────────────────────────────────────
 from config import cfg
 from utils.logger import get_logger
-from stages import stage1_rule_info, stage2_bands, stage3_weights, stage4_executor
+from rules_knowledge import (
+    get_rule, validate_rule_config, ms_to_human, ALREADY_RUNNING
+)
+from stages import stage4_executor
 
 log = get_logger("agent")
 
 
-def run_pipeline(rule_num: str, description: str,
-                 stream_callback=None, model: str = None) -> dict:
+def run_single(rule_num: str, stream_callback=None) -> dict:
     """
-    Full pipeline: Stage1 → Stage2 → Stage3 → Stage4
-    stream_callback(msg: str) used to push progress to UI.
-    model: override which OpenAI model to use for stages 1-3.
-    Returns result dict with success flag and all stage outputs.
+    Install a single rule using local knowledge base.
+    Looks up config → validates → runs install script.
+    Returns result dict.
     """
-    model = model or cfg.OPENAI_MODEL
 
     def emit(msg: str):
         log.info(msg)
@@ -25,142 +28,149 @@ def run_pipeline(rule_num: str, description: str,
 
     result = {
         "rule_num": rule_num,
-        "description": description,
-        "model": model,
+        "description": "",
         "success": False,
-        "stage1": None,
-        "stage2": None,
-        "stage3": None,
-        "stage4": None,
+        "config": None,
+        "validation": None,
         "error": None,
     }
 
     try:
-        emit(f"🧠 Using model: {model}")
+        # ── Lookup ────────────────────────────────────────────────
+        emit(f"🔍 Looking up rule-{rule_num} in knowledge base...")
+        rule_cfg = get_rule(rule_num)
+        if not rule_cfg:
+            emit(f"❌ Rule {rule_num} not found in knowledge base")
+            result["error"] = f"Rule {rule_num} not in catalog"
+            return result
 
-        # ── Stage 1 ──────────────────────────────────────────────
-        emit("▶ Stage 1 — Analyzing rule & determining metadata...")
-        s1 = stage1_rule_info.run(rule_num, description, model=model)
-        result["stage1"] = s1
-        emit(f"  ✓ maxQueryRange: {s1['maxQueryRange']}ms ({_ms_to_human(s1['maxQueryRange'])})")
-        emit(f"  ✓ Exit conditions: {len(s1['exit_conditions'])}")
-        for ec in s1["exit_conditions"]:
-            emit(f"    {ec['subRuleRef']}: {ec['reason']}")
+        result["description"] = rule_cfg["description"]
+        result["config"] = rule_cfg
+        emit(f"  ✓ Found: {rule_cfg['description']}")
+        cats = ", ".join(rule_cfg.get("categories", []))
+        emit(f"  ℹ Categories: {cats}")
 
-        # ── Stage 2 ──────────────────────────────────────────────
-        emit("▶ Stage 2 — Generating band configuration...")
-        s2 = stage2_bands.run(rule_num, description, s1["exit_conditions"], model=model)
-        result["stage2"] = s2
-        emit(f"  ✓ {len(s2['bands'])} bands generated")
-        if s2.get("measured_value_explanation"):
-            emit(f"  ℹ Measured value: {s2['measured_value_explanation']}")
-        for b in s2["bands"]:
-            limits = []
-            if "lowerLimit" in b:
-                limits.append(f"lower={b['lowerLimit']}")
-            if "upperLimit" in b:
-                limits.append(f"upper={b['upperLimit']}")
-            limit_str = f" ({', '.join(limits)})" if limits else ""
-            emit(f"    {b['subRuleRef']}: {b['reason']}{limit_str}")
+        # ── Check if already running ──────────────────────────────
+        if rule_num in ALREADY_RUNNING:
+            emit(f"⚠ Rule {rule_num} is already deployed — proceeding with reinstall")
 
-        # ── Stage 3 ──────────────────────────────────────────────
-        emit("▶ Stage 3 — Generating typology weights...")
-        s3 = stage3_weights.run(
-            rule_num, description,
-            s2["bands"], s1["exit_conditions"],
-            model=model,
-        )
-        result["stage3"] = s3
-        emit(f"  ✓ {len(s3['weights'])} weight entries")
-        for w in s3["weights"]:
-            emit(f"    {w['ref']} → {w['wght']}")
-
-        # ── Cross-stage validation ────────────────────────────────
-        emit("▶ Validating cross-stage consistency...")
-        issues = _validate_outputs(s1, s2, s3)
+        # ── Validate ──────────────────────────────────────────────
+        emit("🔬 Validating configuration...")
+        issues = validate_rule_config(rule_num)
+        result["validation"] = issues
         if issues:
             for issue in issues:
                 emit(f"  ⚠ {issue}")
-        else:
-            emit("  ✓ All outputs consistent")
+            emit("❌ Configuration validation failed — aborting")
+            result["error"] = f"Validation failed: {'; '.join(issues)}"
+            return result
+        emit("  ✓ Configuration valid")
 
-        # ── Stage 4 ──────────────────────────────────────────────
-        emit("▶ Stage 4 — Running install script...")
+        # ── Display config summary ────────────────────────────────
+        emit("📋 Configuration summary:")
+        emit(f"  Query range: {rule_cfg['maxQueryRange']}ms ({ms_to_human(rule_cfg['maxQueryRange'])})")
+
+        emit(f"  Exit conditions ({len(rule_cfg['exit_conditions'])}):")
+        for ec in rule_cfg["exit_conditions"]:
+            emit(f"    {ec['subRuleRef']}: {ec['reason']}")
+
+        emit(f"  Bands ({len(rule_cfg['bands'])}):")
+        for b in rule_cfg["bands"]:
+            limits = []
+            if "lowerLimit" in b:
+                limits.append(f"≥{b['lowerLimit']}")
+            if "upperLimit" in b:
+                limits.append(f"<{b['upperLimit']}")
+            lim = " ".join(limits) if limits else "—"
+            emit(f"    {b['subRuleRef']} [{lim}]: {b['reason']}")
+
+        emit(f"  Weights ({len(rule_cfg['weights'])}):")
+        for w in rule_cfg["weights"]:
+            bar = "█" * (int(w["wght"]) // 100) if w["wght"] != "0" else "○"
+            emit(f"    {w['ref']} → {w['wght']} {bar}")
+
+        # ── Execute install script ────────────────────────────────
+        emit(f"🚀 Running install-rule.sh for rule-{rule_num}...")
         success = stage4_executor.run(
             rule_num=rule_num,
             image_tag=cfg.IMAGE_TAG,
-            description=description,
-            bands=s2["bands"],
-            exit_conditions=s1["exit_conditions"],
-            weights=s3["weights"],
+            description=rule_cfg["description"],
+            bands=rule_cfg["bands"],
+            exit_conditions=rule_cfg["exit_conditions"],
+            weights=rule_cfg["weights"],
             stream_callback=stream_callback,
         )
 
-        result["stage4"] = {"success": success}
         result["success"] = success
-
         if success:
-            emit(f"✅ Rule {rule_num} installed successfully.")
+            emit(f"✅ Rule {rule_num} ({rule_cfg['description']}) installed successfully!")
         else:
-            emit(f"❌ Script execution failed for rule {rule_num}.")
+            emit(f"❌ Script execution failed for rule-{rule_num}")
+            result["error"] = "Install script returned non-zero exit code"
 
     except Exception as e:
         result["error"] = str(e)
-        log.error(f"Pipeline error: {e}", exc_info=True)
-        emit(f"❌ Pipeline error: {e}")
+        log.error(f"Pipeline error for rule-{rule_num}: {e}", exc_info=True)
+        emit(f"❌ Error installing rule-{rule_num}: {e}")
 
     return result
 
 
-def _ms_to_human(ms: int) -> str:
-    """Convert milliseconds to human-readable string."""
-    seconds = ms / 1000
-    if seconds < 3600:
-        return f"{seconds / 60:.0f} minutes"
-    elif seconds < 86400:
-        return f"{seconds / 3600:.0f} hours"
-    elif seconds < 2592000:
-        return f"{seconds / 86400:.0f} days"
-    else:
-        return f"{seconds / 2592000:.0f} months"
+def run_batch(rule_nums: list, stream_callback=None) -> dict:
+    """
+    Install multiple rules in sequence.
+    Returns summary dict with per-rule results.
+    """
 
+    def emit(msg: str):
+        log.info(msg)
+        if stream_callback:
+            stream_callback(msg)
 
-def _validate_outputs(s1: dict, s2: dict, s3: dict) -> list:
-    """Cross-validate outputs from all three AI stages."""
-    issues = []
-    band_refs = {b["subRuleRef"] for b in s2.get("bands", [])}
-    exit_refs = {e["subRuleRef"] for e in s1.get("exit_conditions", [])}
-    weight_refs = {w["ref"] for w in s3.get("weights", [])}
+    batch_result = {
+        "total": len(rule_nums),
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "results": {},
+    }
 
-    all_required = {".err"} | exit_refs | band_refs
+    emit(f"{'═' * 50}")
+    emit(f"🛡️ Batch Install — {len(rule_nums)} rules queued")
+    emit(f"{'═' * 50}")
+    emit("")
 
-    # Check all refs have weights
-    missing_weights = all_required - weight_refs
-    if missing_weights:
-        issues.append(f"Missing weight entries for: {missing_weights}")
+    for idx, rule_num in enumerate(rule_nums, 1):
+        emit(f"{'─' * 50}")
+        emit(f"📦 [{idx}/{len(rule_nums)}] Installing rule-{rule_num}...")
+        emit(f"{'─' * 50}")
 
-    # Check for extra weights
-    extra_weights = weight_refs - all_required
-    if extra_weights:
-        issues.append(f"Extra weight entries (no matching ref): {extra_weights}")
+        r = run_single(rule_num, stream_callback=stream_callback)
+        batch_result["results"][rule_num] = r
 
-    # Check band ordering
-    bands = s2.get("bands", [])
-    for i in range(len(bands) - 1):
-        upper = bands[i].get("upperLimit")
-        lower = bands[i + 1].get("lowerLimit")
-        if upper is not None and lower is not None and upper != lower:
-            issues.append(f"Band boundary gap: .0{i+1} upper={upper} vs .0{i+2} lower={lower}")
+        if r["success"]:
+            batch_result["succeeded"] += 1
+        elif r.get("error", "").startswith("Rule") and "not in catalog" in r.get("error", ""):
+            batch_result["skipped"] += 1
+        else:
+            batch_result["failed"] += 1
 
-    # Check weight ordering (higher risk = higher weight)
-    band_weights = [(w["ref"], int(w["wght"])) for w in s3.get("weights", [])
-                    if w["ref"] in band_refs]
-    band_weights.sort(key=lambda x: x[0])
-    for i in range(len(band_weights) - 1):
-        if band_weights[i][1] < band_weights[i + 1][1]:
-            issues.append(
-                f"Weight inversion: {band_weights[i][0]}={band_weights[i][1]} "
-                f"< {band_weights[i+1][0]}={band_weights[i+1][1]}"
-            )
+        emit("")
 
-    return issues
+    # ── Final summary ─────────────────────────────────────────────
+    emit(f"{'═' * 50}")
+    emit(f"📊 BATCH COMPLETE")
+    emit(f"{'═' * 50}")
+    emit(f"  ✅ Succeeded: {batch_result['succeeded']}")
+    emit(f"  ❌ Failed:    {batch_result['failed']}")
+    emit(f"  ⏭️  Skipped:   {batch_result['skipped']}")
+    emit(f"  📦 Total:     {batch_result['total']}")
+
+    if batch_result["failed"] > 0:
+        emit("")
+        emit("Failed rules:")
+        for rn, r in batch_result["results"].items():
+            if not r["success"] and r.get("error"):
+                emit(f"  ❌ rule-{rn}: {r['error']}")
+
+    return batch_result
